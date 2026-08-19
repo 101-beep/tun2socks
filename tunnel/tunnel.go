@@ -2,11 +2,11 @@ package tunnel
 
 import (
 	"context"
+	"io"
 	"sync"
 	"time"
 
 	"go.uber.org/atomic"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
 	"github.com/101-beep/tun2socks/v2/core/adapter"
 	"github.com/101-beep/tun2socks/v2/proxy"
@@ -39,17 +39,22 @@ type Tunnel struct {
 	// Where the Tunnel statistics are sent to.
 	manager *statistic.Manager
 
-	// linkEP is the link endpoint (TUN device) for injecting
+	// tunWriter is the raw TUN device for injecting
 	// TCP RST / ICMP Destination Unreachable packets back to the
-	// kernel when a dial fails. Set via SetLinkEndpoint after
+	// kernel when a dial fails. Set via SetTUNWriter after
 	// construction; can be nil for tunnels that don't need smart
 	// error responses.
 	//
-	// Without this set, the tunnel falls back to the original behavior:
-	// originConn.Close() on every failure, which sends FIN and confuses
-	// applications that want to distinguish "port closed" from "host down".
-	linkEP   stack.LinkEndpoint
-	linkEPMu sync.RWMutex
+	// We deliberately bypass gvisor's LinkEndpoint.WritePackets here
+	// because that path requires the endpoint to be in StateStarted
+	// and a couple of state fields line up; the tun2socks TUN device
+	// is fine to use as a LinkEndpoint for normal traffic but rejects
+	// direct WritePackets with "endpoint is in invalid state" from
+	// our injection goroutine. Direct io.Writer.Write() goes straight
+	// to the TUN fd and the kernel reads it as if it arrived from
+	// the network — exactly what we want.
+	tunWriter   io.Writer
+	tunWriterMu sync.RWMutex
 
 	procOnce   sync.Once
 	procCancel context.CancelFunc
@@ -66,20 +71,24 @@ func New(proxy proxy.Proxy, manager *statistic.Manager) *Tunnel {
 	}
 }
 
-// SetLinkEndpoint stores the link endpoint so the tunnel can inject
+// SetTUNWriter stores the raw TUN writer so the tunnel can inject
 // smart error packets (TCP RST for connection-refused, ICMP Destination
 // Unreachable for host-unreachable) back to the kernel when a dial
 // through the proxy fails. Idempotent; safe to call from any goroutine.
-func (t *Tunnel) SetLinkEndpoint(ep stack.LinkEndpoint) {
-	t.linkEPMu.Lock()
-	defer t.linkEPMu.Unlock()
-	t.linkEP = ep
+//
+// The TUN device (from github.com/101-beep/tun2socks/v2/core/device/tun)
+// implements io.Writer via Write([]byte) (int, error), so any reference
+// to it (e.g. the *tun.TUN returned by tun.Open) can be passed here.
+func (t *Tunnel) SetTUNWriter(w io.Writer) {
+	t.tunWriterMu.Lock()
+	defer t.tunWriterMu.Unlock()
+	t.tunWriter = w
 }
 
-func (t *Tunnel) getLinkEndpoint() stack.LinkEndpoint {
-	t.linkEPMu.RLock()
-	defer t.linkEPMu.RUnlock()
-	return t.linkEP
+func (t *Tunnel) getTUNWriter() io.Writer {
+	t.tunWriterMu.RLock()
+	defer t.tunWriterMu.RUnlock()
+	return t.tunWriter
 }
 
 // TCPIn return fan-in TCP queue.

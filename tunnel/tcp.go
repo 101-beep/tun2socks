@@ -9,9 +9,7 @@ import (
 	"sync"
 	"time"
 
-	gbuffer "gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/checksum"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
 	"github.com/101-beep/tun2socks/v2/buffer"
 	"github.com/101-beep/tun2socks/v2/core/adapter"
@@ -80,12 +78,12 @@ func (t *Tunnel) handleTCPConn(originConn adapter.TCPConn) {
 //
 // Returns true when a packet was actually injected (caller should
 // skip the deferred originConn.Close() to avoid racing FIN/RST).
-// Returns false when no link endpoint is set or the classification
+// Returns false when no TUN writer is set or the classification
 // didn't match a known category (caller falls back to graceful close).
 func (t *Tunnel) injectSmartError(m *M.Metadata, dialErr error) bool {
-	linkEP := t.getLinkEndpoint()
-	if linkEP == nil {
-		// No link endpoint registered — fall back to the original
+	tunW := t.getTUNWriter()
+	if tunW == nil {
+		// No TUN writer registered — fall back to the original
 		// behavior (graceful close via the deferred originConn.Close()).
 		return false
 	}
@@ -94,19 +92,19 @@ func (t *Tunnel) injectSmartError(m *M.Metadata, dialErr error) bool {
 	case "connection-refused":
 		// Port closed, host alive. Kernel sees RST → ECONNREFUSED.
 		log.Debugf("[TCP] smart-error: TCP RST for %s (connection-refused)", m.DestinationAddress())
-		return writeTCPRST(linkEP, m)
+		return writeTCPRST(tunW, m)
 
 	case "network-unreachable":
 		// Routing issue. Kernel sees ICMP Net Unreachable → ENETUNREACH.
 		log.Debugf("[TCP] smart-error: ICMP Net Unreachable for %s", m.DestinationAddress())
-		return writeICMPUnreachable(linkEP, m, 0)
+		return writeICMPUnreachable(tunW, m, 0)
 
 	case "host-unreachable", "proxy-timeout", "proxy-gave-up":
 		// Host down or filtered. Kernel sees ICMP → EHOSTUNREACH
 		// so the application knows it's a routing issue, not a port issue.
 		log.Debugf("[TCP] smart-error: ICMP Host Unreachable for %s (%s)",
 			m.DestinationAddress(), classifyForSmartError(dialErr))
-		return writeICMPUnreachable(linkEP, m, 1)
+		return writeICMPUnreachable(tunW, m, 1)
 
 	default:
 		// Unknown classification — let the defer do its default
@@ -160,7 +158,7 @@ func classifyForSmartError(err error) string {
 //
 // The src IP is the target (the IP the application was trying to reach)
 // so the RST looks like it came from the server that closed the port.
-func writeTCPRST(linkEP stack.LinkEndpoint, m *M.Metadata) bool {
+func writeTCPRST(w io.Writer, m *M.Metadata) bool {
 	if !m.SrcIP.Is4() || !m.DstIP.Is4() {
 		return false
 	}
@@ -202,7 +200,7 @@ func writeTCPRST(linkEP stack.LinkEndpoint, m *M.Metadata) bool {
 	tcpCS := checksum.Checksum(append(pseudo, tcpHdr...), 0)
 	binary.BigEndian.PutUint16(pkt[20+16:20+18], tcpCS)
 
-	return injectToTUN(linkEP, pkt)
+	return injectToTUN(w, pkt)
 }
 
 // writeICMPUnreachable writes an ICMPv4 Destination Unreachable packet
@@ -219,7 +217,7 @@ func writeTCPRST(linkEP stack.LinkEndpoint, m *M.Metadata) bool {
 //
 //	code=0 → network unreachable
 //	code=1 → host unreachable
-func writeICMPUnreachable(linkEP stack.LinkEndpoint, m *M.Metadata, code uint8) bool {
+func writeICMPUnreachable(w io.Writer, m *M.Metadata, code uint8) bool {
 	if !m.SrcIP.Is4() || !m.DstIP.Is4() {
 		return false
 	}
@@ -289,42 +287,31 @@ func writeICMPUnreachable(linkEP stack.LinkEndpoint, m *M.Metadata, code uint8) 
 	icmpCS := checksum.Checksum(icmpBody, 0)
 	binary.BigEndian.PutUint16(pkt[ipHdrLen+2:ipHdrLen+4], icmpCS)
 
-	return injectToTUN(linkEP, pkt)
+	return injectToTUN(w, pkt)
 }
 
-// injectToTUN writes a raw IP packet to the TUN device via the
-// LinkEndpoint, so the kernel processes it as if it arrived from the
-// network. Safe to call concurrently with gvisor's own writes.
+// injectToTUN writes a raw IP packet directly to the TUN device so the
+// kernel processes it as if it arrived from the network. Bypasses
+// gvisor's LinkEndpoint.WritePackets (which rejects with "endpoint is
+// in invalid state" from a non-stack goroutine) and goes straight to
+// the TUN fd via io.Writer.
+//
+// Safe to call concurrently with gvisor's own writes — the TUN
+// device's Write method is internally synchronized.
 //
 // Returns true on success, false on failure (the caller should fall
 // back to the default graceful close in that case).
-func injectToTUN(linkEP stack.LinkEndpoint, packet []byte) bool {
-	if linkEP == nil {
+func injectToTUN(w io.Writer, packet []byte) bool {
+	if w == nil {
 		return false
 	}
-	// The gvisor buffer API in this version has no NewVectorisedView;
-	// build a View, copy the bytes in, wrap as a Buffer.
-	view := gbuffer.NewViewSize(len(packet))
-	if _, err := view.Write(packet); err != nil {
-		log.Warnf("[TCP] smart-error: view.Write failed: %v", err)
-		return false
-	}
-
-	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: gbuffer.MakeWithView(view),
-	})
-	defer pkt.DecRef()
-
-	pkts := stack.PacketBufferList{}
-	pkts.PushBack(pkt)
-
-	n, err := linkEP.WritePackets(pkts)
+	n, err := w.Write(packet)
 	if err != nil {
-		log.Warnf("[TCP] smart-error: WritePackets failed: %v", err)
+		log.Warnf("[TCP] smart-error: TUN write failed: %v", err)
 		return false
 	}
-	if n == 0 {
-		log.Warnf("[TCP] smart-error: WritePackets wrote 0 packets")
+	if n != len(packet) {
+		log.Warnf("[TCP] smart-error: TUN short write: %d/%d bytes", n, len(packet))
 		return false
 	}
 	return true
