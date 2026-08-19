@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"time"
 
 	"github.com/101-beep/tun2socks/v2/transport/internal/bufferpool"
 )
@@ -168,6 +169,43 @@ type User struct {
 	Password string
 }
 
+// DefaultDialTimeout is the maximum time to wait for a SOCKS5 CONNECT
+// reply from the proxy. If zero (default), no deadline is applied and
+// the dial may block until the proxy's own timeout (which on many
+// implementations is "never" — they wait for the upstream SYN to
+// resolve).
+//
+// Setting this lets the caller distinguish:
+//
+//   - "host unreachable / filtered" (we time out before the proxy replies)
+//   - "port refused" (proxy replies 0x05 quickly)
+//   - "proxy closed silently" (EOF within the deadline — non-RFC proxy)
+//
+// Set this from your application's main() before any dial happens:
+//
+//	socks5.DefaultDialTimeout = 3 * time.Second
+var DefaultDialTimeout time.Duration
+
+// ErrDialTimeout is returned by ClientHandshake when the SOCKS5 proxy
+// did not send a CONNECT reply within DefaultDialTimeout.
+//
+// Use errors.Is to detect:
+//
+//	if errors.Is(err, socks5.ErrDialTimeout) { /* unreachable / filtered */ }
+var ErrDialTimeout = errors.New("socks5: dial timeout (no reply from proxy)")
+
+// ErrDialUnreachable is returned when the SOCKS5 proxy closed the
+// underlying connection without sending a CONNECT reply. This is what
+// happens with "fail-close with FIN" proxy implementations (common in
+// Shadowsocks, V2Ray, and many commercial SOCKS5 frontends) when the
+// upstream host is unreachable or filtered — they don't bother sending
+// a proper RFC 1928 reply code, they just shut the TCP connection.
+//
+// Use errors.Is to detect:
+//
+//	if errors.Is(err, socks5.ErrDialUnreachable) { /* proxy gave up silently */ }
+var ErrDialUnreachable = errors.New("socks5: dial unreachable (proxy closed connection without reply)")
+
 // ClientHandshake fast-tracks SOCKS initialization to get target address to connect on client side.
 func ClientHandshake(rw io.ReadWriter, addr Addr, command Command, user *User) (Addr, error) {
 	buf := make([]byte, MaxAddrLen)
@@ -246,13 +284,36 @@ func ClientHandshake(rw io.ReadWriter, addr Addr, command Command, user *User) (
 		return nil, err
 	}
 
+	// Apply a read deadline so we can distinguish "no reply" cases.
+	// If rw is not a net.Conn (e.g. a test pipe), skip silently.
+	if DefaultDialTimeout > 0 {
+		if conn, ok := rw.(net.Conn); ok {
+			_ = conn.SetReadDeadline(time.Now().Add(DefaultDialTimeout))
+		}
+	}
+
 	// VER, REP, RSV
 	if _, err := io.ReadFull(rw, buf[:3]); err != nil {
+		// Classify the failure so the caller can switch on it.
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			return nil, ErrDialTimeout
+		}
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("%w: %v", ErrDialUnreachable, err)
+		}
 		return nil, err
 	}
 
 	if rep := Reply(buf[1]); rep != 0x00 /* SUCCEEDED */ {
-    return nil, &ReplyError{Command: command, Reply: rep}
+		return nil, &ReplyError{Command: command, Reply: rep}
+	}
+
+	// Clear the deadline before the follow-up read of the bound address
+	// so it isn't racing the deadline we set for the CONNECT reply.
+	if DefaultDialTimeout > 0 {
+		if conn, ok := rw.(net.Conn); ok {
+			_ = conn.SetReadDeadline(time.Time{})
+		}
 	}
 
 	return ReadAddr(rw, buf)
@@ -384,9 +445,9 @@ func DecodeUDPPacket(packet []byte) (addr Addr, payload []byte, err error) {
 	// end-of-fragment sequence, while a value of X'00' indicates that this
 	// datagram is standalone.  Values between 1 and 127 indicate the
 	// fragment position within a fragment sequence.  Each receiver will
-	// have a REASSEMBLY QUEUE and a REASSEMBLY TIMER associated with these
-	// fragments.  The reassembly queue must be reinitialized and the
-	// associated fragments abandoned whenever the REASSEMBLY TIMER expires,
+	// have a REASSEMBLY QUEUE and a FRAGMENT REASSEMBLY TIMER associated
+	// with these fragments.  The reassembly queue must be reinitialized and
+	// the associated fragments abandoned whenever the REASSEMBLY TIMER expires,
 	// or a new datagram arrives carrying a FRAG field whose value is less
 	// than the highest FRAG value processed for this fragment sequence.
 	// The reassembly timer MUST be no less than 5 seconds.  It is
