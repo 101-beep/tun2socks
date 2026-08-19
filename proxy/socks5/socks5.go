@@ -8,11 +8,11 @@ import (
 	"net"
 	"net/url"
 
-	"github.com/xjasonlyu/tun2socks/v2/dialer"
-	M "github.com/xjasonlyu/tun2socks/v2/metadata"
-	"github.com/xjasonlyu/tun2socks/v2/proxy"
-	"github.com/xjasonlyu/tun2socks/v2/proxy/internal/utils"
-	"github.com/xjasonlyu/tun2socks/v2/transport/socks5"
+	"github.com/101-beep/tun2socks/v2/dialer"
+	M "github.com/101-beep/tun2socks/v2/metadata"
+	"github.com/101-beep/tun2socks/v2/proxy"
+	"github.com/101-beep/tun2socks/v2/proxy/internal/utils"
+	"github.com/101-beep/tun2socks/v2/transport/socks5"
 )
 
 var _ proxy.Proxy = (*Socks5)(nil)

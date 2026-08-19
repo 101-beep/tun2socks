@@ -7,11 +7,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xjasonlyu/tun2socks/v2/buffer"
-	"github.com/xjasonlyu/tun2socks/v2/core/adapter"
-	"github.com/xjasonlyu/tun2socks/v2/log"
-	M "github.com/xjasonlyu/tun2socks/v2/metadata"
-	"github.com/xjasonlyu/tun2socks/v2/tunnel/statistic"
+	"github.com/101-beep/tun2socks/v2/buffer"
+	"github.com/101-beep/tun2socks/v2/core/adapter"
+	"github.com/101-beep/tun2socks/v2/log"
+	M "github.com/101-beep/tun2socks/v2/metadata"
+	"github.com/101-beep/tun2socks/v2/tunnel/statistic"
 )
 
 func (t *Tunnel) handleTCPConn(originConn adapter.TCPConn) {

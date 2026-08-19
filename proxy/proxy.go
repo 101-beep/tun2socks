@@ -5,7 +5,7 @@ import (
 	"context"
 	"net"
 
-	M "github.com/xjasonlyu/tun2socks/v2/metadata"
+	M "github.com/101-beep/tun2socks/v2/metadata"
 )
 
 type Proxy interface {

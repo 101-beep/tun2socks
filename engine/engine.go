@@ -12,15 +12,15 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
-	"github.com/xjasonlyu/tun2socks/v2/core"
-	"github.com/xjasonlyu/tun2socks/v2/core/adapter"
-	"github.com/xjasonlyu/tun2socks/v2/core/device"
-	"github.com/xjasonlyu/tun2socks/v2/core/option"
-	"github.com/xjasonlyu/tun2socks/v2/dialer"
-	"github.com/xjasonlyu/tun2socks/v2/log"
-	"github.com/xjasonlyu/tun2socks/v2/proxy"
-	"github.com/xjasonlyu/tun2socks/v2/restapi"
-	"github.com/xjasonlyu/tun2socks/v2/tunnel"
+	"github.com/101-beep/tun2socks/v2/core"
+	"github.com/101-beep/tun2socks/v2/core/adapter"
+	"github.com/101-beep/tun2socks/v2/core/device"
+	"github.com/101-beep/tun2socks/v2/core/option"
+	"github.com/101-beep/tun2socks/v2/dialer"
+	"github.com/101-beep/tun2socks/v2/log"
+	"github.com/101-beep/tun2socks/v2/proxy"
+	"github.com/101-beep/tun2socks/v2/restapi"
+	"github.com/101-beep/tun2socks/v2/tunnel"
 )
 
 var (

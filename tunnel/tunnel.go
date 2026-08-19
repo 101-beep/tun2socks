@@ -7,9 +7,9 @@ import (
 
 	"go.uber.org/atomic"
 
-	"github.com/xjasonlyu/tun2socks/v2/core/adapter"
-	"github.com/xjasonlyu/tun2socks/v2/proxy"
-	"github.com/xjasonlyu/tun2socks/v2/tunnel/statistic"
+	"github.com/101-beep/tun2socks/v2/core/adapter"
+	"github.com/101-beep/tun2socks/v2/proxy"
+	"github.com/101-beep/tun2socks/v2/tunnel/statistic"
 )
 
 const (

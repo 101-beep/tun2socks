@@ -1,4 +1,4 @@
-module github.com/xjasonlyu/tun2socks/v2
+module github.com/101-beep/tun2socks/v2
 
 go 1.26.3
 
