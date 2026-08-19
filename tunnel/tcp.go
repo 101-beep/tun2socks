@@ -23,7 +23,18 @@ import (
 )
 
 func (t *Tunnel) handleTCPConn(originConn adapter.TCPConn) {
-	defer originConn.Close()
+	// responded tracks whether injectSmartError already wrote a
+	// kernel-level response (TCP RST / ICMP). When true, we skip
+	// the deferred originConn.Close() — otherwise gvisor's Close
+	// would send a graceful FIN that races with our RST/ICMP and
+	// leaves the application confused (e.g. nxc reports "Unknown
+	// SSH Version" instead of "No route to host").
+	responded := false
+	defer func() {
+		if !responded {
+			originConn.Close()
+		}
+	}()
 
 	id := originConn.ID()
 	metadata := &M.Metadata{
@@ -49,7 +60,9 @@ func (t *Tunnel) handleTCPConn(originConn adapter.TCPConn) {
 		//	network-unreachable    → ICMP Net Unreachable  (ENETUNREACH)
 		//	proxy-timeout          → ICMP Host Unreachable (EHOSTUNREACH)
 		//	proxy-gave-up (EOF)    → ICMP Host Unreachable (EHOSTUNREACH)
-		t.injectSmartError(metadata, err)
+		if t.injectSmartError(metadata, err) {
+			responded = true
+		}
 		return
 	}
 	metadata.MidIP, metadata.MidPort = parseNetAddr(remoteConn.LocalAddr())
@@ -64,31 +77,42 @@ func (t *Tunnel) handleTCPConn(originConn adapter.TCPConn) {
 // injectSmartError translates a proxy-level dial failure into the
 // appropriate kernel-level response, so applications on the host see
 // the right error code instead of a generic "connection closed".
-func (t *Tunnel) injectSmartError(m *M.Metadata, dialErr error) {
+//
+// Returns true when a packet was actually injected (caller should
+// skip the deferred originConn.Close() to avoid racing FIN/RST).
+// Returns false when no link endpoint is set or the classification
+// didn't match a known category (caller falls back to graceful close).
+func (t *Tunnel) injectSmartError(m *M.Metadata, dialErr error) bool {
 	linkEP := t.getLinkEndpoint()
 	if linkEP == nil {
 		// No link endpoint registered — fall back to the original
 		// behavior (graceful close via the deferred originConn.Close()).
-		return
+		return false
 	}
 
 	switch classifyForSmartError(dialErr) {
 	case "connection-refused":
 		// Port closed, host alive. Kernel sees RST → ECONNREFUSED.
-		writeTCPRST(linkEP, m)
+		log.Debugf("[TCP] smart-error: TCP RST for %s (connection-refused)", m.DestinationAddress())
+		return writeTCPRST(linkEP, m)
 
 	case "network-unreachable":
 		// Routing issue. Kernel sees ICMP Net Unreachable → ENETUNREACH.
-		writeICMPUnreachable(linkEP, m, 0)
+		log.Debugf("[TCP] smart-error: ICMP Net Unreachable for %s", m.DestinationAddress())
+		return writeICMPUnreachable(linkEP, m, 0)
 
 	case "host-unreachable", "proxy-timeout", "proxy-gave-up":
 		// Host down or filtered. Kernel sees ICMP → EHOSTUNREACH
 		// so the application knows it's a routing issue, not a port issue.
-		writeICMPUnreachable(linkEP, m, 1)
+		log.Debugf("[TCP] smart-error: ICMP Host Unreachable for %s (%s)",
+			m.DestinationAddress(), classifyForSmartError(dialErr))
+		return writeICMPUnreachable(linkEP, m, 1)
 
 	default:
-		// Unknown classification — do nothing extra, let Close() do
-		// its default thing.
+		// Unknown classification — let the defer do its default
+		// graceful close via originConn.Close().
+		log.Debugf("[TCP] smart-error: no classification match for %v", dialErr)
+		return false
 	}
 }
 
@@ -131,16 +155,19 @@ func classifyForSmartError(err error) string {
 // writeTCPRST writes a TCP RST packet to the TUN so the kernel returns
 // ECONNREFUSED to the application.
 //
-//	IPv4: src=tunIP, dst=srcIP, proto=TCP
-//	TCP:  srcPort=dstPort, dstPort=srcPort, flags=RST|ACK
-func writeTCPRST(linkEP stack.LinkEndpoint, m *M.Metadata) {
+//	IPv4: src=targetIP, dst=clientIP, proto=TCP
+//	TCP:  srcPort=targetPort, dstPort=clientPort, flags=RST|ACK
+//
+// The src IP is the target (the IP the application was trying to reach)
+// so the RST looks like it came from the server that closed the port.
+func writeTCPRST(linkEP stack.LinkEndpoint, m *M.Metadata) bool {
 	if !m.SrcIP.Is4() || !m.DstIP.Is4() {
-		return // IPv6 not handled here (most TUNs are v4)
+		return false
 	}
-	srcIP := m.SrcIP.AsSlice()
-	dstIP := m.DstIP.AsSlice()
+	srcIP := m.SrcIP.AsSlice() // client IP
+	dstIP := m.DstIP.AsSlice() // target IP
 	if len(srcIP) != 4 || len(dstIP) != 4 {
-		return
+		return false
 	}
 
 	ipHdr := make([]byte, 20)
@@ -149,11 +176,11 @@ func writeTCPRST(linkEP stack.LinkEndpoint, m *M.Metadata) {
 	ipHdr[6] = 0x40 // DF
 	ipHdr[8] = 64   // TTL
 	ipHdr[9] = 6    // TCP
-	copy(ipHdr[12:16], dstIP) // src = our TUN IP
+	copy(ipHdr[12:16], dstIP) // src = target (the closed-port server)
 	copy(ipHdr[16:20], srcIP) // dst = originating client
 
 	tcpHdr := make([]byte, 20)
-	binary.BigEndian.PutUint16(tcpHdr[0:2], uint16(m.DstPort)) // src = original target port
+	binary.BigEndian.PutUint16(tcpHdr[0:2], uint16(m.DstPort)) // src = target port
 	binary.BigEndian.PutUint16(tcpHdr[2:4], uint16(m.SrcPort)) // dst = client port
 	// seq=0, ack=0
 	tcpHdr[12] = 0x50 // data offset = 5
@@ -175,82 +202,113 @@ func writeTCPRST(linkEP stack.LinkEndpoint, m *M.Metadata) {
 	tcpCS := checksum.Checksum(append(pseudo, tcpHdr...), 0)
 	binary.BigEndian.PutUint16(pkt[20+16:20+18], tcpCS)
 
-	injectToTUN(linkEP, pkt)
+	return injectToTUN(linkEP, pkt)
 }
 
 // writeICMPUnreachable writes an ICMPv4 Destination Unreachable packet
 // to the TUN so the kernel returns EHOSTUNREACH (or ENETUNREACH) to
 // the application.
 //
+// Packet layout (RFC 792):
+//
+//	IP header (20)         — src=tunIP, dst=clientIP, proto=ICMP(1)
+//	ICMP header (8)        — type=3, code=0|1, cksum, unused=0
+//	Quoted IP hdr (20)     — the original packet's IP header
+//	Quoted payload (8)     — first 8 bytes of original L4 (enough for
+//	                         the kernel to match it to the right socket)
+//
 //	code=0 → network unreachable
 //	code=1 → host unreachable
-func writeICMPUnreachable(linkEP stack.LinkEndpoint, m *M.Metadata, code uint8) {
+func writeICMPUnreachable(linkEP stack.LinkEndpoint, m *M.Metadata, code uint8) bool {
 	if !m.SrcIP.Is4() || !m.DstIP.Is4() {
-		return
+		return false
 	}
-	srcIP := m.SrcIP.AsSlice()
-	dstIP := m.DstIP.AsSlice()
+	srcIP := m.SrcIP.AsSlice() // application IP (the original sender)
+	dstIP := m.DstIP.AsSlice() // target IP (the unreachable host)
 	if len(srcIP) != 4 || len(dstIP) != 4 {
-		return
+		return false
 	}
 
-	// IP header: src=tunIP, dst=srcIP, proto=ICMP
-	ipHdr := make([]byte, 20)
-	ipHdr[0] = 0x45
-	binary.BigEndian.PutUint16(ipHdr[2:4], 20+8+28) // IP + ICMP + quoted IP
-	ipHdr[6] = 0x40
-	ipHdr[8] = 64
-	ipHdr[9] = 1 // ICMP
+	const (
+		ipHdrLen     = 20
+		icmpHdrLen   = 8
+		quotedIPLen  = 20
+		quotedPayLen = 8
+		totalLen     = ipHdrLen + icmpHdrLen + quotedIPLen + quotedPayLen // 56
+	)
+
+	// Outer IP header: src=ourTunIP, dst=clientIP, proto=ICMP.
+	ipHdr := make([]byte, ipHdrLen)
+	ipHdr[0] = 0x45 // version=4, IHL=5
+	binary.BigEndian.PutUint16(ipHdr[2:4], totalLen)
+	ipHdr[6] = 0x40 // DF
+	ipHdr[8] = 64   // TTL
+	ipHdr[9] = 1    // ICMP
+	// The "source" of the ICMP error is the IP that the application
+	// was trying to reach. This matches what a real router would do
+	// (it would source the ICMP from the destination's network).
+	// Some kernels accept any source; using the target IP makes the
+	// error look like it came from the host that the application
+	// was trying to talk to.
 	copy(ipHdr[12:16], dstIP)
 	copy(ipHdr[16:20], srcIP)
 
-	// ICMP header: type=3, code=code, cksum, unused=0
-	icmp := make([]byte, 8)
-	icmp[0] = 3 // Destination Unreachable
+	// ICMP header: type=3, code, cksum, unused=0.
+	icmp := make([]byte, icmpHdrLen)
+	icmp[0] = 3  // Destination Unreachable
 	icmp[1] = code
-	// checksum and unused filled below
+	// Bytes 2-3 = checksum, filled below.
+	// Bytes 4-7 = unused (zero).
 
-	// Quoted original IP header (we don't have the actual bytes, so
-	// build a minimal header that identifies the target). The kernel
-	// uses this for matching the response to a socket, not for
-	// validity, so a stripped header is fine.
-	quoted := make([]byte, 28)
-	quoted[0] = 0x45
-	binary.BigEndian.PutUint16(quoted[2:4], 40)
-	quoted[6] = 0x40
-	quoted[8] = 64
-	quoted[9] = 6 // TCP (the original was TCP)
-	copy(quoted[12:16], dstIP) // was the target
-	copy(quoted[16:20], srcIP) // was the client
-	binary.BigEndian.PutUint16(quoted[20:22], uint16(m.DstPort))
-	binary.BigEndian.PutUint16(quoted[22:24], uint16(m.SrcPort))
-	// 8 bytes of "original payload" — zero is fine for matching.
+	// Quoted original IP header (20 bytes) — minimal, the kernel only
+	// uses src/dst to match the ICMP to a socket.
+	quotedIP := make([]byte, quotedIPLen)
+	quotedIP[0] = 0x45
+	binary.BigEndian.PutUint16(quotedIP[2:4], quotedIPLen+quotedPayLen)
+	quotedIP[6] = 0x40
+	quotedIP[8] = 64
+	quotedIP[9] = 6 // TCP (the original L4 was TCP)
+	copy(quotedIP[12:16], dstIP) // original destination
+	copy(quotedIP[16:20], srcIP) // original source
 
-	icmp = append(icmp, quoted...)
-	pkt := append(ipHdr, icmp...)
+	// Quoted original L4 (8 bytes — TCP source+dst ports are here).
+	quotedPay := make([]byte, quotedPayLen)
+	binary.BigEndian.PutUint16(quotedPay[0:2], uint16(m.DstPort))
+	binary.BigEndian.PutUint16(quotedPay[2:4], uint16(m.SrcPort))
+
+	// Assemble: ipHdr + icmp + quotedIP + quotedPay
+	icmpBody := append(icmp, quotedIP...)
+	icmpBody = append(icmpBody, quotedPay...)
+	pkt := append(ipHdr, icmpBody...)
 
 	// IP header checksum.
-	ipCS := checksum.Checksum(pkt[:20], 0)
+	ipCS := checksum.Checksum(pkt[:ipHdrLen], 0)
 	binary.BigEndian.PutUint16(pkt[10:12], ipCS)
 
-	// ICMP checksum.
-	icmpCS := checksum.Checksum(icmp, 0)
-	binary.BigEndian.PutUint16(pkt[20+2:20+4], icmpCS)
+	// ICMP checksum (over ICMP header + body).
+	icmpCS := checksum.Checksum(icmpBody, 0)
+	binary.BigEndian.PutUint16(pkt[ipHdrLen+2:ipHdrLen+4], icmpCS)
 
-	injectToTUN(linkEP, pkt)
+	return injectToTUN(linkEP, pkt)
 }
 
 // injectToTUN writes a raw IP packet to the TUN device via the
 // LinkEndpoint, so the kernel processes it as if it arrived from the
 // network. Safe to call concurrently with gvisor's own writes.
-func injectToTUN(linkEP stack.LinkEndpoint, packet []byte) {
+//
+// Returns true on success, false on failure (the caller should fall
+// back to the default graceful close in that case).
+func injectToTUN(linkEP stack.LinkEndpoint, packet []byte) bool {
 	if linkEP == nil {
-		return
+		return false
 	}
 	// The gvisor buffer API in this version has no NewVectorisedView;
 	// build a View, copy the bytes in, wrap as a Buffer.
 	view := gbuffer.NewViewSize(len(packet))
-	view.Write(packet)
+	if _, err := view.Write(packet); err != nil {
+		log.Warnf("[TCP] smart-error: view.Write failed: %v", err)
+		return false
+	}
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: gbuffer.MakeWithView(view),
@@ -260,9 +318,16 @@ func injectToTUN(linkEP stack.LinkEndpoint, packet []byte) {
 	pkts := stack.PacketBufferList{}
 	pkts.PushBack(pkt)
 
-	if _, err := linkEP.WritePackets(pkts); err != nil {
-		log.Debugf("[TCP] inject packet: %v", err)
+	n, err := linkEP.WritePackets(pkts)
+	if err != nil {
+		log.Warnf("[TCP] smart-error: WritePackets failed: %v", err)
+		return false
 	}
+	if n == 0 {
+		log.Warnf("[TCP] smart-error: WritePackets wrote 0 packets")
+		return false
+	}
+	return true
 }
 
 // pipe copies data to & from provided net.Conn(s) bidirectionally.
