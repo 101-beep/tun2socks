@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.uber.org/atomic"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
 	"github.com/101-beep/tun2socks/v2/core/adapter"
 	"github.com/101-beep/tun2socks/v2/proxy"
@@ -38,6 +39,18 @@ type Tunnel struct {
 	// Where the Tunnel statistics are sent to.
 	manager *statistic.Manager
 
+	// linkEP is the link endpoint (TUN device) for injecting
+	// TCP RST / ICMP Destination Unreachable packets back to the
+	// kernel when a dial fails. Set via SetLinkEndpoint after
+	// construction; can be nil for tunnels that don't need smart
+	// error responses.
+	//
+	// Without this set, the tunnel falls back to the original behavior:
+	// originConn.Close() on every failure, which sends FIN and confuses
+	// applications that want to distinguish "port closed" from "host down".
+	linkEP   stack.LinkEndpoint
+	linkEPMu sync.RWMutex
+
 	procOnce   sync.Once
 	procCancel context.CancelFunc
 }
@@ -51,6 +64,22 @@ func New(proxy proxy.Proxy, manager *statistic.Manager) *Tunnel {
 		manager:    manager,
 		procCancel: func() { /* nop */ },
 	}
+}
+
+// SetLinkEndpoint stores the link endpoint so the tunnel can inject
+// smart error packets (TCP RST for connection-refused, ICMP Destination
+// Unreachable for host-unreachable) back to the kernel when a dial
+// through the proxy fails. Idempotent; safe to call from any goroutine.
+func (t *Tunnel) SetLinkEndpoint(ep stack.LinkEndpoint) {
+	t.linkEPMu.Lock()
+	defer t.linkEPMu.Unlock()
+	t.linkEP = ep
+}
+
+func (t *Tunnel) getLinkEndpoint() stack.LinkEndpoint {
+	t.linkEPMu.RLock()
+	defer t.linkEPMu.RUnlock()
+	return t.linkEP
 }
 
 // TCPIn return fan-in TCP queue.
