@@ -252,7 +252,7 @@ func ClientHandshake(rw io.ReadWriter, addr Addr, command Command, user *User) (
 	}
 
 	if rep := Reply(buf[1]); rep != 0x00 /* SUCCEEDED */ {
-		return nil, fmt.Errorf("%s: %s", command, rep)
+    return nil, &ReplyError{Command: command, Reply: rep}
 	}
 
 	return ReadAddr(rw, buf)
@@ -414,4 +414,15 @@ func EncodeUDPPacket(addr Addr, payload []byte) (packet []byte, err error) {
 	}
 	packet = bytes.Join([][]byte{{0x00, 0x00, 0x00}, addr, payload}, nil)
 	return packet, err
+}
+
+// ReplyError carries the SOCKS5 reply code so callers can switch on it
+// via errors.As instead of string-matching the error text.
+type ReplyError struct {
+	Command Command
+	Reply   Reply
+}
+
+func (e *ReplyError) Error() string {
+	return fmt.Sprintf("%s: %s", e.Command, e.Reply)
 }

@@ -81,12 +81,8 @@ func (h *HTTP) shakeHand(metadata *M.Metadata, rw io.ReadWriter) error {
 	switch resp.StatusCode {
 	case http.StatusOK:
 		return nil
-	case http.StatusProxyAuthRequired:
-		return errors.New("HTTP auth required by proxy")
-	case http.StatusMethodNotAllowed:
-		return errors.New("CONNECT method not allowed by proxy")
 	default:
-		return fmt.Errorf("HTTP connect status: %s", resp.Status)
+		return &StatusError{Code: resp.StatusCode, Status: resp.Status}
 	}
 }
 
@@ -110,4 +106,15 @@ func Parse(u *url.URL) (proxy.Proxy, error) {
 
 func init() {
 	proxy.RegisterProtocol("http", Parse)
+}
+
+// StatusError carries the HTTP status code from a failed CONNECT so callers
+// can switch on it via errors.As.
+type StatusError struct {
+	Code   int
+	Status string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("HTTP connect status: %s", e.Status)
 }
