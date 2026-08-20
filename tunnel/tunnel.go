@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"go.uber.org/atomic"
-
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
 	"github.com/101-beep/tun2socks/v2/core/adapter"
