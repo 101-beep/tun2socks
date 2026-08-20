@@ -4,6 +4,7 @@ package tun
 
 import (
 	"fmt"
+	"sync"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/rawfile"
@@ -17,9 +18,11 @@ import (
 type TUN struct {
 	stack.LinkEndpoint
 
-	fd   int
-	mtu  uint32
-	name string
+	fd      int
+	mtu     uint32
+	name    string
+	closed  bool
+	closeMu sync.Mutex
 }
 
 func Open(name string, mtu uint32) (device.Device, error) {
@@ -77,6 +80,12 @@ func (t *TUN) Name() string {
 }
 
 func (t *TUN) Close() {
+	t.closeMu.Lock()
+	defer t.closeMu.Unlock()
+	if t.closed {
+		return
+	}
+	t.closed = true
 	defer t.LinkEndpoint.Close()
 	_ = unix.Close(t.fd)
 }
