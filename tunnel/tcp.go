@@ -2,14 +2,14 @@ package tunnel
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"sync"
 	"time"
 
-	"gvisor.dev/gvisor/pkg/tcpip/checksum"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
 	"github.com/101-beep/tun2socks/v2/buffer"
 	"github.com/101-beep/tun2socks/v2/core/adapter"
@@ -21,12 +21,11 @@ import (
 )
 
 func (t *Tunnel) handleTCPConn(originConn adapter.TCPConn) {
-	// responded tracks whether injectSmartError already wrote a
-	// kernel-level response (TCP RST / ICMP). When true, we skip
-	// the deferred originConn.Close() — otherwise gvisor's Close
-	// would send a graceful FIN that races with our RST/ICMP and
-	// leaves the application confused (e.g. nxc reports "Unknown
-	// SSH Version" instead of "No route to host").
+	// responded tracks whether injectSmartError already aborted the
+	// gvisor endpoint (which emits a RST to the kernel). When true,
+	// we skip the deferred originConn.Close() — otherwise gvisor's
+	// graceful close would race our RST and the application might
+	// see EOF instead of ECONNREFUSED.
 	responded := false
 	defer func() {
 		if !responded {
@@ -50,15 +49,15 @@ func (t *Tunnel) handleTCPConn(originConn adapter.TCPConn) {
 	if err != nil {
 		log.Warnf("[TCP] dial %s: %v", metadata.DestinationAddress(), err)
 		// Smart error translation: instead of letting Close() send
-		// a bare FIN (which confuses apps), inject the right
-		// kernel-level response based on what the proxy told us.
-		//
-		//	connection-refused     → TCP RST               (ECONNREFUSED)
-		//	host-unreachable       → ICMP Host Unreachable (EHOSTUNREACH)
-		//	network-unreachable    → ICMP Net Unreachable  (ENETUNREACH)
-		//	proxy-timeout          → ICMP Host Unreachable (EHOSTUNREACH)
-		//	proxy-gave-up (EOF)    → ICMP Host Unreachable (EHOSTUNREACH)
-		if t.injectSmartError(metadata, err) {
+		// a bare FIN (which apps read as "Unknown SSH Version" or
+		// similar false positive), abort the gvisor endpoint that
+		// corresponds to this connection. Abort() calls
+		// resetConnectionLocked, which emits a TCP RST with valid
+		// sequence numbers drawn from the endpoint's own state
+		// machine — so the kernel socket receives the RST, the
+		// application's read() returns ECONNREFUSED, and tools like
+		// nxc report the right errno.
+		if t.injectSmartError(metadata, id, err) {
 			responded = true
 		}
 		return
@@ -73,51 +72,88 @@ func (t *Tunnel) handleTCPConn(originConn adapter.TCPConn) {
 }
 
 // injectSmartError translates a proxy-level dial failure into the
-// appropriate kernel-level response, so applications on the host see
-// the right error code instead of a generic "connection closed".
+// appropriate kernel-level response by aborting the gvisor TCP endpoint
+// that represents this connection. The endpoint's state machine then
+// sends a real TCP RST (with valid sequence numbers) to the kernel,
+// which surfaces as ECONNREFUSED on the application's read().
 //
-// Returns true when a packet was actually injected (caller should
-// skip the deferred originConn.Close() to avoid racing FIN/RST).
-// Returns false when no TUN writer is set or the classification
-// didn't match a known category (caller falls back to graceful close).
-func (t *Tunnel) injectSmartError(m *M.Metadata, dialErr error) bool {
-	tunW := t.getTUNWriter()
-	if tunW == nil {
-		// No TUN writer registered — fall back to the original
-		// behavior (graceful close via the deferred originConn.Close()).
+// Why Abort() rather than crafting RST/ICMP packets by hand and
+// writing them to the TUN fd?
+//   - Abort() draws the seq number from the endpoint's own sndNxt /
+//     sndWnd state. A hand-crafted RST with seq=0 is rejected by the
+//     kernel's tcp_validate_incoming (RFC 5961) because it's outside
+//     the receiver's window.
+//   - Writing raw packets to the TUN fd on Linux requires
+//     fdbased.NewInjectable instead of the regular New — the gvisor
+//     endpoint doesn't expose io.Writer, and the regular WritePackets
+//     path was reported to be state-checked. Switching the fork's
+//     tun_netstack.go is invasive.
+//   - The TCP RST kernel socket sees is the same one gvisor would
+//     emit on a normal connection close — there's nothing custom
+//     about it that could trip the kernel.
+//
+// Limitation: gvisor's Abort() always emits RST, regardless of the
+// underlying failure. That means every smart-error path surfaces as
+// ECONNREFUSED to the application — even host-unreachable, which would
+// more correctly be EHOSTUNREACH. This is a known trade-off. If we
+// ever need finer-grained errnos, we'd have to inject ICMP Destination
+// Unreachable into gvisor's stack via Stack.Inject (a different API
+// path that this fork doesn't currently expose).
+//
+// Returns true when the endpoint was found and aborted (caller should
+// skip the deferred originConn.Close()). Returns false when no stack
+// is wired up, the endpoint can't be found (already closed), or the
+// classification didn't match a known category — caller falls back
+// to graceful close.
+func (t *Tunnel) injectSmartError(m *M.Metadata, id stack.TransportEndpointID, dialErr error) bool {
+	// classifyForSmartError is a coarse boolean at this point — we
+	// use it only to suppress smart-error on unrecognized categories
+	// (which currently means: nothing matches → graceful close). The
+	// actual RST is always a RST regardless of category, because
+	// Abort() doesn't take a category argument.
+	category := classifyForSmartError(dialErr)
+	if category == "" {
+		// No recognized category — fall back to graceful close.
 		return false
 	}
 
-	switch classifyForSmartError(dialErr) {
-	case "connection-refused":
-		// Port closed, host alive. Kernel sees RST → ECONNREFUSED.
-		log.Debugf("[TCP] smart-error: TCP RST for %s (connection-refused)", m.DestinationAddress())
-		return writeTCPRST(tunW, m)
-
-	case "network-unreachable":
-		// Routing issue. Kernel sees ICMP Net Unreachable → ENETUNREACH.
-		log.Debugf("[TCP] smart-error: ICMP Net Unreachable for %s", m.DestinationAddress())
-		return writeICMPUnreachable(tunW, m, 0)
-
-	case "host-unreachable", "proxy-timeout", "proxy-gave-up":
-		// Host down or filtered. Kernel sees ICMP → EHOSTUNREACH
-		// so the application knows it's a routing issue, not a port issue.
-		log.Debugf("[TCP] smart-error: ICMP Host Unreachable for %s (%s)",
-			m.DestinationAddress(), classifyForSmartError(dialErr))
-		return writeICMPUnreachable(tunW, m, 1)
-
-	default:
-		// Unknown classification — let the defer do its default
-		// graceful close via originConn.Close().
-		log.Debugf("[TCP] smart-error: no classification match for %v", dialErr)
+	stk := t.getStack()
+	if stk == nil {
+		log.Debugf("[TCP] smart-error: no gvisor stack wired up; falling back to graceful close")
 		return false
 	}
+
+	// Look up the gvisor endpoint. The ID passed in here is the same
+	// TransportEndpointID that the kernel-side socket was created
+	// from — same local IP/port (target's IP/22), same remote IP/port
+	// (app's IP/ephemeral). NICID=0 is the wildcard "any NIC" sentinel
+	// (findTransportEndpoint falls back to 0 if the requested NICID
+	// isn't in the table).
+	ep := stk.FindTransportEndpoint(
+		header.IPv4ProtocolNumber,
+		header.TCPProtocolNumber,
+		id,
+		0,
+	)
+	if ep == nil {
+		log.Warnf("[TCP] smart-error: endpoint for %s not found (already closed?)",
+			m.DestinationAddress())
+		return false
+	}
+
+	log.Infof("[TCP] smart-error: aborting endpoint for %s (category=%s)",
+		m.DestinationAddress(), category)
+	ep.Abort()
+	return true
 }
 
 // classifyForSmartError maps a dial error to a category used by
 // injectSmartError. Mirrors the classification logic in the
 // classifyingProxy wrapper but kept in the library so the error
 // response doesn't depend on the application.
+//
+// Currently only the boolean "is this an error we want smart-error
+// for?" matters — see injectSmartError comment.
 func classifyForSmartError(err error) string {
 	if err == nil {
 		return ""
@@ -148,173 +184,6 @@ func classifyForSmartError(err error) string {
 		}
 	}
 	return ""
-}
-
-// writeTCPRST writes a TCP RST packet to the TUN so the kernel returns
-// ECONNREFUSED to the application.
-//
-//	IPv4: src=targetIP, dst=clientIP, proto=TCP
-//	TCP:  srcPort=targetPort, dstPort=clientPort, flags=RST|ACK
-//
-// The src IP is the target (the IP the application was trying to reach)
-// so the RST looks like it came from the server that closed the port.
-func writeTCPRST(w io.Writer, m *M.Metadata) bool {
-	if !m.SrcIP.Is4() || !m.DstIP.Is4() {
-		return false
-	}
-	srcIP := m.SrcIP.AsSlice() // client IP
-	dstIP := m.DstIP.AsSlice() // target IP
-	if len(srcIP) != 4 || len(dstIP) != 4 {
-		return false
-	}
-
-	ipHdr := make([]byte, 20)
-	ipHdr[0] = 0x45 // version=4, IHL=5
-	binary.BigEndian.PutUint16(ipHdr[2:4], 40)
-	ipHdr[6] = 0x40 // DF
-	ipHdr[8] = 64   // TTL
-	ipHdr[9] = 6    // TCP
-	copy(ipHdr[12:16], dstIP) // src = target (the closed-port server)
-	copy(ipHdr[16:20], srcIP) // dst = originating client
-
-	tcpHdr := make([]byte, 20)
-	binary.BigEndian.PutUint16(tcpHdr[0:2], uint16(m.DstPort)) // src = target port
-	binary.BigEndian.PutUint16(tcpHdr[2:4], uint16(m.SrcPort)) // dst = client port
-	// seq=0, ack=0
-	tcpHdr[12] = 0x50 // data offset = 5
-	tcpHdr[13] = 0x14 // RST|ACK
-	// window=0
-
-	pkt := append(ipHdr, tcpHdr...)
-
-	// IP header checksum.
-	ipCS := checksum.Checksum(pkt[:20], 0)
-	binary.BigEndian.PutUint16(pkt[10:12], ipCS)
-
-	// TCP checksum with pseudo-header.
-	pseudo := make([]byte, 12)
-	copy(pseudo[0:4], dstIP)
-	copy(pseudo[4:8], srcIP)
-	pseudo[9] = 6 // TCP
-	binary.BigEndian.PutUint16(pseudo[10:12], 20)
-	tcpCS := checksum.Checksum(append(pseudo, tcpHdr...), 0)
-	binary.BigEndian.PutUint16(pkt[20+16:20+18], tcpCS)
-
-	return injectToTUN(w, pkt)
-}
-
-// writeICMPUnreachable writes an ICMPv4 Destination Unreachable packet
-// to the TUN so the kernel returns EHOSTUNREACH (or ENETUNREACH) to
-// the application.
-//
-// Packet layout (RFC 792):
-//
-//	IP header (20)         — src=tunIP, dst=clientIP, proto=ICMP(1)
-//	ICMP header (8)        — type=3, code=0|1, cksum, unused=0
-//	Quoted IP hdr (20)     — the original packet's IP header
-//	Quoted payload (8)     — first 8 bytes of original L4 (enough for
-//	                         the kernel to match it to the right socket)
-//
-//	code=0 → network unreachable
-//	code=1 → host unreachable
-func writeICMPUnreachable(w io.Writer, m *M.Metadata, code uint8) bool {
-	if !m.SrcIP.Is4() || !m.DstIP.Is4() {
-		return false
-	}
-	srcIP := m.SrcIP.AsSlice() // application IP (the original sender)
-	dstIP := m.DstIP.AsSlice() // target IP (the unreachable host)
-	if len(srcIP) != 4 || len(dstIP) != 4 {
-		return false
-	}
-
-	const (
-		ipHdrLen     = 20
-		icmpHdrLen   = 8
-		quotedIPLen  = 20
-		quotedPayLen = 8
-		totalLen     = ipHdrLen + icmpHdrLen + quotedIPLen + quotedPayLen // 56
-	)
-
-	// Outer IP header: src=ourTunIP, dst=clientIP, proto=ICMP.
-	ipHdr := make([]byte, ipHdrLen)
-	ipHdr[0] = 0x45 // version=4, IHL=5
-	binary.BigEndian.PutUint16(ipHdr[2:4], totalLen)
-	ipHdr[6] = 0x40 // DF
-	ipHdr[8] = 64   // TTL
-	ipHdr[9] = 1    // ICMP
-	// The "source" of the ICMP error is the IP that the application
-	// was trying to reach. This matches what a real router would do
-	// (it would source the ICMP from the destination's network).
-	// Some kernels accept any source; using the target IP makes the
-	// error look like it came from the host that the application
-	// was trying to talk to.
-	copy(ipHdr[12:16], dstIP)
-	copy(ipHdr[16:20], srcIP)
-
-	// ICMP header: type=3, code, cksum, unused=0.
-	icmp := make([]byte, icmpHdrLen)
-	icmp[0] = 3  // Destination Unreachable
-	icmp[1] = code
-	// Bytes 2-3 = checksum, filled below.
-	// Bytes 4-7 = unused (zero).
-
-	// Quoted original IP header (20 bytes) — minimal, the kernel only
-	// uses src/dst to match the ICMP to a socket.
-	quotedIP := make([]byte, quotedIPLen)
-	quotedIP[0] = 0x45
-	binary.BigEndian.PutUint16(quotedIP[2:4], quotedIPLen+quotedPayLen)
-	quotedIP[6] = 0x40
-	quotedIP[8] = 64
-	quotedIP[9] = 6 // TCP (the original L4 was TCP)
-	copy(quotedIP[12:16], dstIP) // original destination
-	copy(quotedIP[16:20], srcIP) // original source
-
-	// Quoted original L4 (8 bytes — TCP source+dst ports are here).
-	quotedPay := make([]byte, quotedPayLen)
-	binary.BigEndian.PutUint16(quotedPay[0:2], uint16(m.DstPort))
-	binary.BigEndian.PutUint16(quotedPay[2:4], uint16(m.SrcPort))
-
-	// Assemble: ipHdr + icmp + quotedIP + quotedPay
-	icmpBody := append(icmp, quotedIP...)
-	icmpBody = append(icmpBody, quotedPay...)
-	pkt := append(ipHdr, icmpBody...)
-
-	// IP header checksum.
-	ipCS := checksum.Checksum(pkt[:ipHdrLen], 0)
-	binary.BigEndian.PutUint16(pkt[10:12], ipCS)
-
-	// ICMP checksum (over ICMP header + body).
-	icmpCS := checksum.Checksum(icmpBody, 0)
-	binary.BigEndian.PutUint16(pkt[ipHdrLen+2:ipHdrLen+4], icmpCS)
-
-	return injectToTUN(w, pkt)
-}
-
-// injectToTUN writes a raw IP packet directly to the TUN device so the
-// kernel processes it as if it arrived from the network. Bypasses
-// gvisor's LinkEndpoint.WritePackets (which rejects with "endpoint is
-// in invalid state" from a non-stack goroutine) and goes straight to
-// the TUN fd via io.Writer.
-//
-// Safe to call concurrently with gvisor's own writes — the TUN
-// device's Write method is internally synchronized.
-//
-// Returns true on success, false on failure (the caller should fall
-// back to the default graceful close in that case).
-func injectToTUN(w io.Writer, packet []byte) bool {
-	if w == nil {
-		return false
-	}
-	n, err := w.Write(packet)
-	if err != nil {
-		log.Warnf("[TCP] smart-error: TUN write failed: %v", err)
-		return false
-	}
-	if n != len(packet) {
-		log.Warnf("[TCP] smart-error: TUN short write: %d/%d bytes", n, len(packet))
-		return false
-	}
-	return true
 }
 
 // pipe copies data to & from provided net.Conn(s) bidirectionally.

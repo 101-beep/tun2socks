@@ -2,11 +2,12 @@ package tunnel
 
 import (
 	"context"
-	"io"
 	"sync"
 	"time"
 
 	"go.uber.org/atomic"
+
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
 	"github.com/101-beep/tun2socks/v2/core/adapter"
 	"github.com/101-beep/tun2socks/v2/proxy"
@@ -39,22 +40,19 @@ type Tunnel struct {
 	// Where the Tunnel statistics are sent to.
 	manager *statistic.Manager
 
-	// tunWriter is the raw TUN device for injecting
-	// TCP RST / ICMP Destination Unreachable packets back to the
-	// kernel when a dial fails. Set via SetTUNWriter after
-	// construction; can be nil for tunnels that don't need smart
-	// error responses.
+	// gvisorStack is the userspace TCP/IP stack that owns the TCP
+	// endpoints for connections flowing through this tunnel. The tunnel
+	// holds a reference so it can call FindTransportEndpoint + Abort
+	// on the endpoint that corresponds to a failed dial — that sends
+	// a real RST to the kernel (with valid sequence numbers from the
+	// endpoint's state machine), so the application sees ECONNREFUSED
+	// instead of EOF.
 	//
-	// We deliberately bypass gvisor's LinkEndpoint.WritePackets here
-	// because that path requires the endpoint to be in StateStarted
-	// and a couple of state fields line up; the tun2socks TUN device
-	// is fine to use as a LinkEndpoint for normal traffic but rejects
-	// direct WritePackets with "endpoint is in invalid state" from
-	// our injection goroutine. Direct io.Writer.Write() goes straight
-	// to the TUN fd and the kernel reads it as if it arrived from
-	// the network — exactly what we want.
-	tunWriter   io.Writer
-	tunWriterMu sync.RWMutex
+	// Set via SetStack after core.CreateStack returns the *stack.Stack.
+	// nil means "no smart-error path available; fall back to graceful
+	// close on dial failures" — same as before this feature was added.
+	gvisorStack   *stack.Stack
+	gvisorStackMu sync.RWMutex
 
 	procOnce   sync.Once
 	procCancel context.CancelFunc
@@ -71,24 +69,26 @@ func New(proxy proxy.Proxy, manager *statistic.Manager) *Tunnel {
 	}
 }
 
-// SetTUNWriter stores the raw TUN writer so the tunnel can inject
-// smart error packets (TCP RST for connection-refused, ICMP Destination
-// Unreachable for host-unreachable) back to the kernel when a dial
-// through the proxy fails. Idempotent; safe to call from any goroutine.
+// SetStack stores the gvisor userspace TCP/IP stack that owns the TCP
+// endpoints for connections flowing through this tunnel. The tunnel
+// uses it to look up the endpoint for a failed dial and call Abort(),
+// which makes the endpoint emit a real RST to the kernel with valid
+// sequence numbers — so the application sees ECONNREFUSED instead of
+// EOF on the next read.
 //
-// The TUN device (from github.com/101-beep/tun2socks/v2/core/device/tun)
-// implements io.Writer via Write([]byte) (int, error), so any reference
-// to it (e.g. the *tun.TUN returned by tun.Open) can be passed here.
-func (t *Tunnel) SetTUNWriter(w io.Writer) {
-	t.tunWriterMu.Lock()
-	defer t.tunWriterMu.Unlock()
-	t.tunWriter = w
+// Call this once after core.CreateStack returns the *stack.Stack and
+// before any SYN reaches the tunnel. Idempotent; safe from any
+// goroutine.
+func (t *Tunnel) SetStack(s *stack.Stack) {
+	t.gvisorStackMu.Lock()
+	defer t.gvisorStackMu.Unlock()
+	t.gvisorStack = s
 }
 
-func (t *Tunnel) getTUNWriter() io.Writer {
-	t.tunWriterMu.RLock()
-	defer t.tunWriterMu.RUnlock()
-	return t.tunWriter
+func (t *Tunnel) getStack() *stack.Stack {
+	t.gvisorStackMu.RLock()
+	defer t.gvisorStackMu.RUnlock()
+	return t.gvisorStack
 }
 
 // TCPIn return fan-in TCP queue.
